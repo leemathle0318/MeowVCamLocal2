@@ -1,0 +1,43 @@
+name: Build iPhone 8 Plus DEB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: MeowVCam-Local-iPhone8Plus
+
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Theos
+        run: bash scripts/setup-ci-macos.sh
+
+      - name: Check source
+        run: bash scripts/check.sh
+
+      - name: Build DEB
+        run: bash scripts/build-macos.sh
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v7
+        with:
+          name: MeowVCamLocal-iPhone8Plus-DEB
+          path: MeowVCam-Local-iPhone8Plus/packages/*.deb
+          if-no-files-found: error
+          retention-days: 7
