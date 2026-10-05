@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ] || [ "${1:-}" = upgrade ]; then
+    launcher=/bin/launchctl
+    [ -x "$launcher" ] || launcher=/var/jb/bin/launchctl
+    "$launcher" bootout system /var/jb/Library/LaunchDaemons/com.meowmeow.vcam.local.decoder.plist >/dev/null 2>&1 || true
+fi
+exit 0

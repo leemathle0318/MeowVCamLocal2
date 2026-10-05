@@ -1,0 +1,9 @@
+Package: com.meowmeow.vcam.local.iphone8plus
+Name: MeowVCam Local iPhone8Plus Prototype
+Version: 0.4.0
+Architecture: iphoneos-arm64
+Description: Local video camera source with video audio mixed into live microphone PCM. Volume up then volume down menu. No artificial file size or duration cap. Requires iOS build and device validation.
+Maintainer: MeowVCam Project
+Author: MeowVCam Project
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0), firmware (<< 16.7)

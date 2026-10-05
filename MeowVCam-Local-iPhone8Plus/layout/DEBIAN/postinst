@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = configure ]; then
+    pref=/var/mobile/Library/Preferences/com.meowmeow.vcam.local.plist
+    defaults=/var/jb/usr/share/meowvcam-local/defaults.plist
+    # Reset configuration on install/upgrade so a previously enabled source
+    # cannot immediately reproduce a startup freeze in this diagnostic revision.
+    if [ -f "$defaults" ]; then
+        mkdir -p /var/mobile/Library/Preferences
+        cp "$defaults" "$pref"
+        chmod 0644 "$pref"
+        chown mobile:mobile "$pref"
+    fi
+    launcher=/bin/launchctl
+    [ -x "$launcher" ] || launcher=/var/jb/bin/launchctl
+    "$launcher" bootout system /var/jb/Library/LaunchDaemons/com.meowmeow.vcam.local.decoder.plist >/dev/null 2>&1 || true
+    "$launcher" bootstrap system /var/jb/Library/LaunchDaemons/com.meowmeow.vcam.local.decoder.plist ||
+        echo 'Decoder helper was not loaded yet; use the jailbreak tool to reboot userspace.' >&2
+fi
+exit 0
