@@ -1,43 +1,316 @@
-name: Build iPhone 8 Plus DEB
-
+name: Build tk assistant session logging deb
 on:
   workflow_dispatch:
-
+  push:
+    branches: [main, master]
 permissions:
   contents: read
-
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 40
-
-    defaults:
-      run:
-        shell: bash
-        working-directory: MeowVCam-Local-iPhone8Plus
-
+    timeout-minutes: 60
     env:
-      HOMEBREW_NO_AUTO_UPDATE: "1"
-
+      THEOS: ${{ github.workspace }}/work/theos
+      THEOS_COMMIT: 304e0799973e8145f32e4ca2de6c747a84b758ce
+      SDKS_COMMIT: 0222fd5413cf4b9af096f37b4621afa2688572f7
+      HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
-      - name: Download source
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      - name: Set up Theos
-        run: bash scripts/setup-ci-macos.sh
-
-      - name: Check source
-        run: bash scripts/check.sh
-
-      - name: Build DEB
-        run: bash scripts/build-macos.sh
-
-      - name: Upload DEB
-        uses: actions/upload-artifact@v7
+      - name: Locate source and check upload completeness
+        id: layout
+        run: |
+          python3 - <<'PY'
+          import os
+          import stat
+          import zipfile
+          from pathlib import Path, PurePosixPath
+          root = Path.cwd()
+          search_root = root
+          print('Run branch:', os.environ.get('GITHUB_REF_NAME', 'local-test'))
+          print('Run commit:', os.environ.get('GITHUB_SHA', 'local-test'))
+          zip_files = sorted(path for path in root.rglob('*') if path.is_file()
+              and path.suffix.lower() == '.zip'
+              and not any(part in {'.git', 'work', 'vendor', '.theos'} for part in path.relative_to(root).parts))
+          print('ZIP files in this checkout:', [str(path.relative_to(root)) for path in zip_files])
+          source_archives = []
+          old_source_archives = []
+          for path in zip_files:
+              try:
+                  with zipfile.ZipFile(path) as package:
+                      names = set(package.namelist())
+                      for name in names:
+                          if PurePosixPath(name).name != 'SystemHooks.mm':
+                              continue
+                          sibling = str(PurePosixPath(name).parent / 'Makefile')
+                          if sibling in names:
+                              control_name = str(PurePosixPath(name).parent / 'control')
+                              if control_name in names and package.getinfo(control_name).file_size <= 65536:
+                                  control = package.read(control_name).decode('utf-8', 'replace')
+                                  if any(line.strip() == 'Version: 0.3.0' for line in control.splitlines()):
+                                      source_archives.append(path)
+                                  else:
+                                      old_source_archives.append(path)
+                              else:
+                                  old_source_archives.append(path)
+                              break
+              except (zipfile.BadZipFile, OSError):
+                  print('Not a readable source ZIP:', repr(str(path.relative_to(root))))
+          if old_source_archives:
+              print('Skipping old/unversioned source ZIPs:', [str(path.relative_to(root)) for path in old_source_archives])
+          if not source_archives and old_source_archives:
+              print('::error::This workflow requires OBSBridge 0.3.0 read-only-consumer media source. Upload the new source ZIP; older ZIPs do not have the latest transport and diagnostic changes.')
+              raise SystemExit(1)
+          preferred = root / 'OBSBridge-source-0.3.0.zip'
+          archive = preferred if preferred in source_archives else None
+          if archive is None and len(source_archives) == 1:
+              archive = source_archives[0]
+          if archive is None and len(source_archives) > 1:
+              print('::error::Multiple 0.3.0 source ZIPs found. Keep one, or name the desired one OBSBridge-source-0.3.0.zip at repository root.')
+              print('Source ZIPs:', [str(path.relative_to(root)) for path in source_archives])
+              raise SystemExit(1)
+          if archive is not None:
+              destination = (root / 'work' / 'obsbridge-source').resolve()
+              if not destination.is_relative_to(root.resolve()):
+                  raise SystemExit('Unsafe extraction directory')
+              with zipfile.ZipFile(archive) as package:
+                  members = package.infolist()
+                  if len(members) > 1000 or sum(item.file_size for item in members) > 64 * 1024 * 1024:
+                      raise SystemExit('Source ZIP exceeds expected size')
+                  for item in members:
+                      path = PurePosixPath(item.filename)
+                      if path.is_absolute() or '..' in path.parts or '\\' in item.filename or ':' in item.filename:
+                          raise SystemExit('Unsafe path in source ZIP')
+                      if stat.S_ISLNK(item.external_attr >> 16):
+                          raise SystemExit('Symlinks are not allowed in source ZIP')
+                      target = (destination / item.filename).resolve()
+                      if not target.is_relative_to(destination):
+                          raise SystemExit('Source ZIP path escapes extraction directory')
+                  destination.mkdir(parents=True, exist_ok=True)
+                  package.extractall(destination)
+              search_root = destination
+              print('Extracted source ZIP:', str(archive.relative_to(root)))
+          candidates = []
+          for path in search_root.rglob('SystemHooks.mm'):
+              relative = path.relative_to(search_root)
+              if any(part in {'.git', 'work', 'vendor', '.theos'} for part in relative.parts):
+                  continue
+              if (path.parent / 'Makefile').is_file():
+                  candidates.append(path.parent)
+          if len(candidates) != 1:
+              print('::error::No usable OBSBridge source found in this checkout. Upload the complete source ZIP, commit it, and start a new run on that same branch. Renamed ZIPs and subfolders are supported.')
+              print('Source candidates:', [str(p.relative_to(root)) for p in candidates])
+              raise SystemExit(1)
+          source = candidates[0]
+          required = [
+              'LOGGING_BASELINE_SHA256.json', 'SessionLog.h', 'SessionLog.mm', 'core/SessionJournal.hpp', 'controlapp/LogExport.h', 'controlapp/LogExport.m',
+            'tests/session_journal_tests.cpp', 'tests/session_log_foundation_tests.mm', 'tests/test_session_logs.py', 'scripts/run_session_log_tests.sh',
+            'layout/Library/libSandy/local.xiaoguai.obsbridge.log-read.plist',
+            'Makefile', 'control', 'OBSBridge.plist', 'SystemHooks.mm',
+              'CaptureClockIPC.h', 'CaptureClockIPC.mm', 'core/CaptureClockFeedback.hpp', 'core/CaptureClockWire.hpp', 'core/CaptureClockMailbox.hpp',
+              'core/FFmpegAudioTimeline.hpp', 'core/CaptureClockedAudio.hpp', 'core/PreparedCapturePCM.hpp',
+              'core/CaptureOutputWorker.hpp', 'core/CommonPresentationClock.hpp', 'core/HostPCMRead.hpp', 'scripts/run_new_audio_tests.sh',
+              'tests/capture_clock_tests.cpp', 'tests/capture_wire_tests.cpp', 'tests/common_clock_tests.cpp',
+              'tests/ffmpeg_timeline_tests.cpp', 'tests/prepared_capture_tests.cpp', 'tests/full_audio_pipeline_tests.cpp', 'tests/test_host_build.py',
+              'AppAudio.mm', 'OBSBridgeLive.plist', 'LiveAudioStatus.h', 'LiveAudioStatus.mm',
+              'core/LiveAudio.hpp', 'core/AudioContinuity.hpp', 'core/AudioReadClock.hpp', 'core/VideoBudget.hpp', 'core/VideoCopy.hpp',
+              'tests/live_audio_tests.cpp', 'tests/audio_continuity_tests.cpp', 'tests/audio_read_clock_tests.cpp', 'tests/video_budget_tests.cpp',
+              'layout/Library/libSandy/local.xiaoguai.obsbridge.live-read.plist',
+              'Receiver.mm', 'Receiver.h', 'Shared.h',
+              'core/RtmpPull.hpp', 'core/VideoTransform.hpp', 'tests/video_transform_tests.cpp',
+              'controlapp/main.mm', 'controlapp/Makefile', 'controlapp/Info.plist', 'layout/DEBIAN/postinst',
+              'layout/Library/libSandy/local.xiaoguai.obsbridge.control-read.plist',
+              'Shortcut.mm', 'Client.h', 'Client.m', 'OBSBridgeSB.plist',
+              'Producer.mm', 'Consumer.mm', 'MediaBus.h', 'MediaBus.mm',
+              'core/SharedMedia.hpp', 'tests/shared_media_tests.cpp',
+          'core/NonblockingRead.hpp', 'core/MappingStatus.hpp', 'tests/nonblocking_read_tests.cpp',
+          'core/MappedMedia.hpp', 'core/PendingFrames.hpp', 'core/PresentationClock.hpp', 'tests/mapped_media_tests.cpp', 'tests/pending_frames_tests.cpp',
+          'SandboxAccess.mm', 'SandboxAccess.h', 'core/AccessAttempt.hpp', 'tests/access_attempt_tests.cpp',
+          'layout/Library/libSandy/local.xiaoguai.obsbridge.media-read.plist',
+              'core/VideoContinuity.hpp', 'tests/video_continuity_tests.cpp',
+              'AudioSample.h', 'AudioSample.mm', 'core/NativePCM.hpp',
+              'core/AudioListQuery.hpp', 'tests/audio_list_contract_tests.cpp',
+              'tests/native_audio_tests.cpp', 'tests/coremedia_audio_tests.mm',
+              'core/Timeline.cpp', 'core/Timeline.hpp',
+              'core/Shortcut.hpp', 'tests/shortcut_tests.cpp',
+              'tests/timeline_tests.cpp', 'tests/check_project.py', 'tests/check_deb.py', 'tests/test_deb_checker.py',
+              'scripts/build_ffmpeg.sh', 'scripts/prepare_packaging.py', 'tests/test_packaging.py', 'THIRD_PARTY.md',
+              'prefs/Makefile', 'prefs/OBPrefs.m',
+              'prefs/Resources/Info.plist', 'prefs/Resources/Root.plist',
+              'layout/Library/PreferenceLoader/Preferences/OBSBridge.plist',
+          ]
+          missing = [name for name in required if not (source / name).is_file()]
+          if missing:
+              for name in missing:
+                  print(f'::error::Missing source file: {name}. Re-upload this file keeping its folder path.')
+              raise SystemExit(1)
+          if 'Version: 0.3.0' not in (source / 'control').read_text(encoding='utf-8'):
+              print('::error::Source version is not 0.3.0. Upload the new volume-shortcut source.')
+              raise SystemExit(1)
+          if '#define OB_VERSION_CODE 0x00030006u' not in (source / 'Shared.h').read_text(encoding='utf-8'):
+              raise SystemExit('This workflow requires pre-repush logging revision 0x00030006; replace old source archives.')
+          # Normalize metadata before host checks and Theos packaging. Git settings
+          # or Windows editors may otherwise turn LF back into CRLF.
+          for name in ('control', 'Makefile', 'prefs/Makefile', 'controlapp/Makefile', 'scripts/build_ffmpeg.sh', 'layout/DEBIAN/postinst'):
+              path = source / name
+              raw = path.read_bytes()
+              normalized = raw.removeprefix(b'\xef\xbb\xbf').replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+              if not normalized.endswith(b'\n'):
+                  normalized += b'\n'
+              if normalized != raw:
+                  path.write_bytes(normalized)
+                  print('Normalized Unix LF:', name)
+          os.chmod(source / 'layout/DEBIAN/postinst', 0o755)
+          directory = source.relative_to(root).as_posix()
+          print('Source directory:', directory)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'source_dir={directory}\n')
+          PY
+      - name: Host audio core tests
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: |
+          mkdir -p work
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            core/Timeline.cpp tests/timeline_tests.cpp -o work/timeline_tests
+          work/timeline_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/shortcut_tests.cpp -o work/shortcut_tests
+          work/shortcut_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            core/Timeline.cpp tests/shared_media_tests.cpp -o work/shared_media_tests
+          work/shared_media_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/nonblocking_read_tests.cpp -o work/nonblocking_read_tests
+          work/nonblocking_read_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/pending_frames_tests.cpp -o work/pending_frames_tests
+          work/pending_frames_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/mapped_media_tests.cpp -o work/mapped_media_tests
+          work/mapped_media_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/access_attempt_tests.cpp -o work/access_attempt_tests
+          work/access_attempt_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/video_continuity_tests.cpp -o work/video_continuity_tests
+          work/video_continuity_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/native_audio_tests.cpp -o work/native_audio_tests
+          work/native_audio_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/audio_list_contract_tests.cpp -o work/audio_list_contract_tests
+          work/audio_list_contract_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/live_audio_tests.cpp -o work/live_audio_tests
+          work/live_audio_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/audio_continuity_tests.cpp -o work/audio_continuity_tests
+          work/audio_continuity_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/audio_read_clock_tests.cpp -o work/audio_read_clock_tests
+          work/audio_read_clock_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/video_budget_tests.cpp -o work/video_budget_tests
+          work/video_budget_tests
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 \
+            tests/video_transform_tests.cpp -o work/video_transform_tests
+          work/video_transform_tests
+          python3 tests/check_project.py
+          python3 -m unittest discover -s tests -p test_deb_checker.py -v
+          python3 -m unittest discover -s tests -p test_packaging.py -v
+          python3 -m unittest discover -s tests -p test_host_build.py -v
+      - name: Session journal and export tests
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: |
+          set -euo pipefail
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 -UNDEBUG tests/session_journal_tests.cpp -o work/session_journal_tests
+          work/session_journal_tests 2>&1 | tee work/session-journal-test.log
+          bash scripts/run_session_log_tests.sh 2>&1 | tee work/session-log-test.log
+          python3 -m unittest discover -s tests -p test_session_logs.py -v
+      - name: CoreMedia audio sample tests
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          xcrun clang++ -std=c++17 -Wall -Wextra -Werror -O2 -fobjc-arc -fblocks \
+            AudioSample.mm tests/coremedia_audio_tests.mm \
+            -framework Foundation -framework CoreMedia -framework AudioToolbox -o work/coremedia_audio_tests \
+            2>&1 | tee work/coremedia-audio-build.log
+          work/coremedia_audio_tests 2>&1 | tee work/coremedia-audio-test.log
+      - name: Build prerequisites
+        run: |
+          brew install make ldid xz
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: Fixed Theos and patched iOS 16.5 SDK
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: |
+          git init "$THEOS"
+          git -C "$THEOS" remote add origin https://github.com/theos/theos.git
+          git -C "$THEOS" fetch --depth=1 origin "$THEOS_COMMIT"
+          git -C "$THEOS" checkout --detach FETCH_HEAD
+          git -C "$THEOS" submodule update --init --recursive --depth=1
+          git init work/sdk-checkout
+          git -C work/sdk-checkout remote add origin https://github.com/theos/sdks.git
+          git -C work/sdk-checkout sparse-checkout init --cone
+          git -C work/sdk-checkout sparse-checkout set iPhoneOS16.5.sdk
+          git -C work/sdk-checkout fetch --depth=1 origin "$SDKS_COMMIT"
+          git -C work/sdk-checkout checkout --detach FETCH_HEAD
+          mkdir -p "$THEOS/sdks"
+          cp -R work/sdk-checkout/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          echo "IOS_SDK_PATH=$THEOS/sdks/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
+          python3 tests/test_packaging.py --dm-pl "$THEOS/vendor/dm.pl/dm.pl"
+      - name: Build FFmpeg decoding libraries
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: bash scripts/build_ffmpeg.sh
+      - name: Pinned FFmpeg 7.1.5 new audio pipeline tests
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: bash scripts/run_new_audio_tests.sh
+      - name: Compile rootless package
+        working-directory: ${{ steps.layout.outputs.source_dir }}
+        run: |
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless \
+            TARGET=iphone:clang:16.5:15.0
+          test -n "$(find packages -name '*.deb' -print -quit)"
+          python3 tests/check_deb.py packages/*.deb
+          python3 scripts/name_package.py packages
+          {
+            echo "Theos: $THEOS_COMMIT"
+            echo "SDKs: $SDKS_COMMIT; iPhoneOS16.5 SDK, deployment 15.0"
+            echo "FFmpeg: 7.1.5; SHA256 de668509caf9e35e3cd162473441fdb29538c6d96ed080292b3cf9e6fc5d558f"
+            xcrun clang --version
+            echo 'Compile success does NOT certify runtime compatibility.'
+          } > packages/build-info.txt
+          # Retain relinkable objects for the static LGPL dependency.
+          mkdir -p work/relink-inputs
+          cp -R .theos/obj work/relink-inputs/plugin
+          if [ -d prefs/.theos/obj ]; then cp -R prefs/.theos/obj work/relink-inputs/preferences; fi
+          cp -R vendor/ffmpeg/lib work/relink-inputs/ffmpeg
+          cp Makefile work/relink-inputs/
+          tar -czf packages/relink-inputs.tar.gz -C work/relink-inputs .
+          cp work/ffmpeg-7.1.5.tar.xz packages/
+          cp THIRD_PARTY.md vendor/ffmpeg/share/licenses/* packages/
+      - uses: actions/upload-artifact@v4
         with:
-          name: MeowVCamLocal-iPhone8Plus-DEB
-          path: MeowVCam-Local-iPhone8Plus/packages/*.deb
+          name: tk推流助手-rootless-deb
+          path: ${{ steps.layout.outputs.source_dir }}/packages/*.deb
           if-no-files-found: error
-          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OBSBridge-build-materials
+          path: ${{ steps.layout.outputs.source_dir }}/packages/
+          if-no-files-found: error
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBSBridge-session-log-build-diagnostics
+          path: |
+            ${{ steps.layout.outputs.source_dir }}/work/ffmpeg-build-*/ffbuild/config.log
+            ${{ steps.layout.outputs.source_dir }}/.theos/obj/
+            ${{ steps.layout.outputs.source_dir }}/work/coremedia-audio-*.log
+            ${{ steps.layout.outputs.source_dir }}/work/*-test.log
+            ${{ steps.layout.outputs.source_dir }}/work/ffmpeg-host-build/ffbuild/config.log
+            ${{ steps.layout.outputs.source_dir }}/work/ffmpeg-host-build/compiler-smoke.log
+            ${{ steps.layout.outputs.source_dir }}/packages/*.deb
+          if-no-files-found: ignore
